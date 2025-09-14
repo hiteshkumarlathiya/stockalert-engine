@@ -1,7 +1,6 @@
 package com.stockalert.service.util;
 
 import java.util.ArrayList;
-import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.NavigableMap;
@@ -17,14 +16,19 @@ import com.stockalert.api.client.UserStockAlertClient;
 import com.stockalert.cache.StockAlertCache;
 import com.stockalert.common.PriceWindow;
 import com.stockalert.common.UserStockAlertDTO;
+import com.stockalert.util.SymbolPriceRanges;
+
+import lombok.extern.slf4j.Slf4j;
 
 @Component
+@Slf4j
 public class StockAlertRegistry {
 
 	// Local cache: symbol -> threshold -> alerts (sorted thresholds)
 	private final Map<String, NavigableMap<Double, List<UserStockAlertDTO>>> alertBuckets = new ConcurrentHashMap<>();
 	// Access timestamps for eviction
 	private final Map<String, Long> lastAccess = new ConcurrentHashMap<>();
+	private final Map<String, SymbolPriceRanges.Range> loadedRanges = new ConcurrentHashMap<>();
 
 	@Autowired
 	private UserStockAlertClient userStockAlertClient;
@@ -42,38 +46,54 @@ public class StockAlertRegistry {
 		// Note: fetching happens via explicit loaders below
 	}
 
-	// Preload full symbol set (used at startup for top symbols)
-	public void loadAllForSymbols(Collection<String> symbols) {
-		if (symbols == null || symbols.isEmpty())
-			return;
-		List<UserStockAlertDTO> alerts = userStockAlertClient.getAlertsBySymbols(new ArrayList<>(symbols));
-		Map<String, List<UserStockAlertDTO>> bySymbol = alerts.stream()
-				.collect(Collectors.groupingBy(UserStockAlertDTO::getSymbol));
-		bySymbol.forEach((sym, list) -> {
-			loadSymbol(sym, list);
-			cache.put(sym, list);
-		});
-	}
-
 	// Load on-demand near price: local miss -> Redis -> DB by price window
 	public void loadSymbolNearPrice(String symbol, double price) {
-		if (alertBuckets.containsKey(symbol)) {
-			touch(symbol);
-			return;
-		}
+        SymbolPriceRanges.Range currentRange = loadedRanges.get(symbol);
+        
+        if (currentRange == null || price < currentRange.min || price > currentRange.max) {
 
-		List<UserStockAlertDTO> alerts = cache.get(symbol);
-		if (alerts == null) {
-			double min = PriceWindow.lower(price);
-			double max = PriceWindow.upper(price);
-			alerts = userStockAlertClient.getAlertsBySymbolAndThresholdRange(symbol, min, max);
-		}
-		if (alerts == null || alerts.isEmpty())
-			return;
+            double min = PriceWindow.lower(price);
+            double max = PriceWindow.upper(price);
 
-		loadSymbol(symbol, alerts);
-		cache.put(symbol, alerts);
-	}
+            // Invalidate Redis cache if range is changing
+            if (currentRange != null && (min != currentRange.min || max != currentRange.max)) {
+                cache.evict(symbol);
+                log.info("Evicted Redis cache for {} due to range change: old={} - {}, new={} - {}",
+                          symbol, currentRange.min, currentRange.max, min, max);
+            }
+
+            // Try Redis (might be empty if just evicted)
+            List<UserStockAlertDTO> alerts = cache.get(symbol);
+            if (alerts == null) {
+                alerts = userStockAlertClient.getAlertsBySymbolAndThresholdRange(symbol, min, max);
+            }
+
+            if (alerts != null && !alerts.isEmpty()) {
+                loadSymbol(symbol, alerts); // local memory
+                cache.put(symbol, alerts);  // refresh Redis TTL
+                loadedRanges.put(symbol, new SymbolPriceRanges.Range(min, max));
+            }
+        } else {
+            touch(symbol);
+        }
+
+        // If no range loaded yet OR price outside current range → reload
+        if (currentRange == null || price < currentRange.min || price > currentRange.max) {
+            double min = PriceWindow.lower(price);
+            double max = PriceWindow.upper(price);
+
+            List<UserStockAlertDTO> alerts = userStockAlertClient.getAlertsBySymbolAndThresholdRange(symbol, min, max);
+
+            if (alerts != null && !alerts.isEmpty()) {
+            	cache.put(symbol, alerts);
+                loadSymbol(symbol, alerts);
+                loadedRanges.put(symbol, new SymbolPriceRanges.Range(min, max));
+            }
+        } else {
+            // Already loaded and price is in range — just touch for eviction tracking
+            touch(symbol);
+        }
+    }
 
 	public void loadSymbol(String symbol, List<UserStockAlertDTO> alerts) {
 		NavigableMap<Double, List<UserStockAlertDTO>> buckets = new ConcurrentSkipListMap<>();
@@ -87,6 +107,8 @@ public class StockAlertRegistry {
 	}
 
 	public void evictSymbol(String symbol) {
+		log.info("Evict Symbol: {}", symbol);
+		loadedRanges.remove(symbol);
 		alertBuckets.remove(symbol);
 		lastAccess.remove(symbol);
 	}

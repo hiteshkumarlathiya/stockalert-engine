@@ -14,6 +14,7 @@ import org.springframework.kafka.annotation.EnableKafka;
 import org.springframework.kafka.config.ConcurrentKafkaListenerContainerFactory;
 import org.springframework.kafka.core.ConsumerFactory;
 import org.springframework.kafka.core.DefaultKafkaConsumerFactory;
+import org.springframework.kafka.listener.ContainerProperties.AckMode;
 import org.springframework.kafka.support.serializer.JsonDeserializer;
 
 import com.stockalert.common.StockPriceEvent;
@@ -46,16 +47,15 @@ public class KafkaConfig {
 		config.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
 		config.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, JsonDeserializer.class);
 		config.put(ConsumerConfig.GROUP_ID_CONFIG, "alert-evaluator");
-		config.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
+		config.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "latest");
 		config.put(JsonDeserializer.TRUSTED_PACKAGES, "com.stockalert.*");
+		config.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, false);
 		return config;
 	}
 	
 	@Bean
     ConsumerFactory<String, StockPriceEvent> consumerFactory() {
 		log.info("Inside consumerFactory");
-//        return new DefaultKafkaConsumerFactory<>(kafkaConfiguration(), new StringDeserializer(), 
-//        	      new JsonDeserializer<>(StockPriceEvent.class));
 		return new DefaultKafkaConsumerFactory<>(kafkaConfiguration());
     }
 
@@ -64,6 +64,8 @@ public class KafkaConfig {
 		log.info("Inside kafkaListenerContainerFactory");
         ConcurrentKafkaListenerContainerFactory<String, StockPriceEvent> factory = new ConcurrentKafkaListenerContainerFactory<>();
         factory.setConsumerFactory(consumerFactory());
+        factory.getContainerProperties().setAckMode(AckMode.MANUAL);
+        factory.setConcurrency(3);
         return factory;
     }
 }
