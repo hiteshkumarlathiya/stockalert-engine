@@ -29,18 +29,7 @@ public class StockAlertSchedulers {
         log.info("evictIdle is completed: {}", (time2 - time1));
     }
 
-    // Optional: periodic preload of frequent symbols
-    @Scheduled(fixedDelay = 300_000) // every 5 minutes
-    public void preloadLikelyHot() {
-    	log.info("preloadLikelyHot is invoked");
-    	long time1 = System.currentTimeMillis();
-        var top = List.of("RELIANCE", "TCS", "HDFCBANK", "ICICIBANK", "SBIN", "INFY", "TATAMOTORS", "ITC", "LT", "BHARTIARTL");
-        registry.loadAllForSymbols(top);
-        long time2 = System.currentTimeMillis();
-        log.info("preloadLikelyHot is completed: {}", (time2 - time1));
-    }
-    
-    @Scheduled(fixedDelay = 300_000) // every 5 minutes
+    @Scheduled(initialDelay = 0, fixedDelay = Long.MAX_VALUE) // every 5 minutes
     public void preloadSymbolPreviousClose() {
         log.info("preloadSymbolPreviousClose is invoked");
         long time1 = System.currentTimeMillis();
@@ -53,6 +42,6 @@ public class StockAlertSchedulers {
             registry.loadSymbolNearPrice(symbol, closePrice);
         });
         long time2 = System.currentTimeMillis();
-        log.info("preloadLikelyHot is completed: {}", (time2 - time1));
+        log.info("preloadSymbolPreviousClose is completed: {}", (time2 - time1));
     }
 }
