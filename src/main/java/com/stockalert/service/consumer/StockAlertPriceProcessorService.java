@@ -16,6 +16,7 @@ import com.stockalert.common.TriggerType;
 import com.stockalert.common.UserStockAlertDTO;
 import com.stockalert.service.publisher.StockAlertTriggerPublisher;
 import com.stockalert.service.util.StockAlertRegistry;
+import com.stockalert.service.util.SymbolEventExecutor;
 
 import lombok.extern.slf4j.Slf4j;
 
@@ -29,85 +30,99 @@ public class StockAlertPriceProcessorService {
 	@Autowired
 	private StockAlertTriggerPublisher dispatcher;
 
+	@Autowired
+	private SymbolEventExecutor symbolEventExecutor;
+
 	@KafkaListener(topics = "${confluent.topic.market.stock.prices}", groupId = "alert-evaluator", containerFactory = "kafkaListenerContainerFactory")
 	public void evaluate(ConsumerRecord<String, StockPriceEvent> record, Acknowledgment ack) {
-		String symbol = null;
-		try {
-			log.info("Thread name:{} :: Stock key: {}, value: {}, partition: {}", 
-					Thread.currentThread().getName(), record.key(), record.value(), record.partition());
-			StockPriceEvent event = record.value();
-			symbol = event.getSymbol();
-			// Ensure symbol is loaded by price proximity (hybrid)
-			long findBucketTime1  = System.currentTimeMillis();
-			NavigableMap<Double, List<UserStockAlertDTO>> buckets = alertRegistry.getAlertsForSymbol(event.getSymbol());
-			if (buckets.isEmpty()) {
-				alertRegistry.loadSymbolNearPrice(event.getSymbol(), event.getPrice());
-				buckets = alertRegistry.getAlertsForSymbol(event.getSymbol());
-			}
-			log.info("Get Bucket for symbol: {}, time: {}", event.getSymbol(), (System.currentTimeMillis() - findBucketTime1));
+		StockPriceEvent event = record.value();
+		String symbol = event.getSymbol();
+		double price = event.getPrice();
 
-			if (buckets.isEmpty()) {
+		// Submit to per-symbol executor to preserve ordering for that symbol
+		symbolEventExecutor.submit(symbol, () -> {
+			try {
+				log.info("Thread={} key={} event={} partition={}", Thread.currentThread().getName(), record.key(),
+						event, record.partition());
+
+				// Ensure correct price band is loaded (handles Redis eviction + reload)
+				long t0 = System.currentTimeMillis();
+				alertRegistry.ensureSymbolLoadedForPrice(symbol, price);
+				NavigableMap<Double, List<UserStockAlertDTO>> buckets = alertRegistry.getAlertsForSymbol(symbol);
+				log.info("Loaded buckets for {} in {} ms (empty={})", symbol, (System.currentTimeMillis() - t0),
+						buckets == null || buckets.isEmpty());
+
+				if (buckets == null || buckets.isEmpty()) {
+					ack.acknowledge();
+					return;
+				}
+
+				// Evaluate triggers
+				List<Long> triggeredAlertIds = processPrice(symbol, price, buckets);
+
+				// Remove triggered alerts atomically (local + Redis)
+				if (!CollectionUtils.isEmpty(triggeredAlertIds)) {
+					alertRegistry.updateTriggeredAlerts(symbol, triggeredAlertIds);
+				}
+
+				// Ack only after successful processing
 				ack.acknowledge();
-				return;
+			} catch (Exception ex) {
+				log.error("Error processing event for symbol {}: {}", symbol, ex.getMessage(), ex);
+				// No ack — let error handler retry
 			}
-
-			// Process alerts for this symbol
-			List<Long> triggerdAlertIds = processPrice(event.getSymbol(), event.getPrice());
-
-			if(!CollectionUtils.isEmpty(triggerdAlertIds)) {
-				alertRegistry.updateTriggeredAlerts(event.getSymbol(), triggerdAlertIds);
-			}
-			// Only acknowledge after successful processing
-			ack.acknowledge();
-		} catch (Exception ex) {
-			log.error("Error processing event for symbol {}: {}", symbol, ex.getMessage(), ex);
-			// Do NOT ack here — message will be retried depending on your error handler
-		}
+		});
 	}
 
-	public List<Long> processPrice(String symbol, double price) {
-		long time = System.currentTimeMillis();
+	private List<Long> processPrice(String symbol, double price,
+			NavigableMap<Double, List<UserStockAlertDTO>> buckets) {
 
-		List<Long> triggerdAlertIds = new ArrayList<>();
+		long tStart = System.currentTimeMillis();
+		List<Long> triggeredAlertIds = new ArrayList<>();
 
-		NavigableMap<Double, List<UserStockAlertDTO>> buckets = alertRegistry.getAlertsForSymbol(symbol);
-		if (buckets == null || buckets.isEmpty()) return triggerdAlertIds;
+		if (buckets == null || buckets.isEmpty())
+			return triggeredAlertIds;
 
-		// collect all alerts having threshold value < CURRENT(inclusive) for ABOVE triggers
-		long abovetime = System.currentTimeMillis();
+		// ABOVE triggers: thresholds < current price
+		long tAbove = System.currentTimeMillis();
 		buckets.headMap(price, false).forEach((threshold, alerts) -> {
 			for (UserStockAlertDTO alert : alerts) {
-				if (shouldTrigger(alert, TriggerType.ABOVE, price)) {
+				if (shouldTrigger(alert, TriggerType.ABOVE)) {
 					dispatchAndMark(alert, price);
-					triggerdAlertIds.add(alert.getAlertId());
+					triggeredAlertIds.add(alert.getAlertId());
 				}
 			}
 		});
-		log.info("ABOVE trigger type processed for symbol: {}, time: {}", symbol, (System.currentTimeMillis() - abovetime));
-		// collect all alerts having threshold value > CURRENT(inclusive) for BELOW triggers
-		long belowTime = System.currentTimeMillis();
+		log.info("ABOVE processed for {} in {} ms", symbol, (System.currentTimeMillis() - tAbove));
+
+		// BELOW triggers: thresholds > current price
+		long tBelow = System.currentTimeMillis();
 		buckets.tailMap(price, false).forEach((threshold, alerts) -> {
 			for (UserStockAlertDTO alert : alerts) {
-				if (shouldTrigger(alert, TriggerType.BELOW, price)) {
+				if (shouldTrigger(alert, TriggerType.BELOW)) {
 					dispatchAndMark(alert, price);
-					triggerdAlertIds.add(alert.getAlertId());
+					triggeredAlertIds.add(alert.getAlertId());
 				}
 			}
 		});
-		log.info("BELOW trigger type processed for symbol: {}, time: {}", symbol, (System.currentTimeMillis() - belowTime));
-		log.info("Process done for symbol: {}, time: {}, bucket_size: {}", symbol, (System.currentTimeMillis() - time), buckets.size());
-		return triggerdAlertIds;
+		log.info("BELOW processed for {} in {} ms", symbol, (System.currentTimeMillis() - tBelow));
+
+		log.info("Process done for {} in {} ms, bucket_size={}, triggered_count={}", symbol,
+				(System.currentTimeMillis() - tStart), buckets.size(), triggeredAlertIds.size());
+
+		return triggeredAlertIds;
 	}
 
-	private boolean shouldTrigger(UserStockAlertDTO alert, TriggerType type, double price) {
-		return alert.isActive()
-				&& !alert.isTriggered()
-				&& alert.getTriggerType() == type;
+	private boolean shouldTrigger(UserStockAlertDTO alert, TriggerType type) {
+		return alert.isActive() && !alert.isTriggered() && alert.getTriggerType() == type;
 	}
 
 	private void dispatchAndMark(UserStockAlertDTO alert, double price) {
+		// Mark to avoid double-processing in this batch
 		alert.setTriggered(true);
 		alert.setActive(false);
+
+		// Publish downstream
 		dispatcher.markAsTriggered(alert, price);
 		dispatcher.notify(alert, price);
 	}
